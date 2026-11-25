@@ -27,11 +27,16 @@ public struct SendView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 switch model.phase {
-                case .waitingForPeer(let code, let link, let spokenCode):
-                    waitingCodeCard(code: code, universalLink: link, spokenCode: spokenCode)
+                case .waitingForPeer(let code, let link, let spokenCode, let shareMessage):
+                    waitingCodeCard(
+                        code: code,
+                        universalLink: link,
+                        spokenCode: spokenCode,
+                        shareMessage: shareMessage
+                    )
                 case .transferring(let isSending, let percent, let summary, let words) where isSending:
                     progressCard(percent: percent, summary: summary, words: words)
-                case .finished(let message):
+                case .finished(let message, _):
                     doneCard(message: message)
                 case .failed(let headline, let cause, let detail):
                     errorCard(headline: headline, cause: cause, detail: detail)
@@ -75,8 +80,9 @@ public struct SendView: View {
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
             } else {
                 ForEach(model.selectedURLs, id: \.self) { url in
+                    let safeName = model.displayFilename(for: url)
                     AdaptiveAccessibilityStack(isAccessibilitySize: dynamicTypeSize.isAccessibilitySize) {
-                        Text(url.lastPathComponent.precomposedStringWithCanonicalMapping)
+                        Text(safeName)
                             .font(.body)
                             .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 8)
@@ -86,7 +92,7 @@ public struct SendView: View {
                             Label("Remove", systemImage: "trash")
                         }
                         .frame(minHeight: minTapHeight)
-                        .accessibilityLabel("Remove \(url.lastPathComponent)")
+                        .accessibilityLabel("Remove \(safeName)")
                     }
                     .padding(12)
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -126,7 +132,12 @@ public struct SendView: View {
         }
     }
 
-    private func waitingCodeCard(code: String, universalLink: String, spokenCode: String) -> some View {
+    private func waitingCodeCard(
+        code: String,
+        universalLink: String,
+        spokenCode: String,
+        shareMessage: String
+    ) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Your code")
                 .font(.subheadline)
@@ -159,7 +170,7 @@ public struct SendView: View {
                 if let url = URL(string: universalLink) {
                     ShareLink(
                         item: url,
-                        message: Text("Get my files with TotalDrop. Code: \(code)")
+                        message: Text(shareMessage.isEmpty ? "Get my files with TotalDrop. Code: \(code)" : shareMessage)
                     ) {
                         Label("Share", systemImage: "square.and.arrow.up")
                             .frame(maxWidth: .infinity, minHeight: minTapHeight)

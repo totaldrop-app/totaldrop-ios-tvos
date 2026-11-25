@@ -15,14 +15,22 @@ public enum IOSTab: String, CaseIterable, Identifiable, Sendable {
     public var id: String { rawValue }
 }
 
-/// Transfer lifecycle state on iOS and iPadOS, synchronized with `totaldrop-apple-mobile-bridge`.
+/// Transfer lifecycle state on iOS and iPadOS, driven live by `totaldrop-apple-mobile-ffi`.
 public enum IOSTransferPhase: Equatable, Sendable {
     case idle
-    case waitingForPeer(code: String, universalLink: String, spokenCode: String)
+    case waitingForPeer(code: String, universalLink: String, spokenCode: String, shareMessage: String)
     case connecting(code: String)
-    case incomingOffer(files: Int, totalBytes: UInt64, words: [String], topLevelNames: [String])
+    case incomingOffer(
+        files: Int,
+        totalBytes: UInt64,
+        formattedSize: String,
+        isText: Bool,
+        words: [String],
+        topLevelNames: [String],
+        hasHiddenControls: Bool
+    )
     case transferring(isSending: Bool, percent: Int, summaryText: String, words: [String])
-    case finished(message: String)
+    case finished(message: String, receivedText: String?)
     case failed(headline: String, cause: String?, technicalDetail: String)
 
     public var isBusy: Bool {
@@ -33,29 +41,65 @@ public enum IOSTransferPhase: Equatable, Sendable {
             return true
         }
     }
+
+    public var activitySlug: String {
+        switch self {
+        case .idle, .finished, .failed:
+            return "idle"
+        case .waitingForPeer:
+            return "active_send"
+        case .connecting:
+            return "active_receive"
+        case .incomingOffer:
+            return "awaiting_user_decision"
+        case .transferring(let isSending, _, _, _):
+            return isSending ? "active_send" : "active_receive"
+        }
+    }
 }
+
+#if os(iOS)
+private final class UncheckedBGTaskBox: @unchecked Sendable {
+    let task: BGTask
+
+    init(_ task: BGTask) {
+        self.task = task
+    }
+}
+#endif
 
 /// Coordinates `BGContinuedProcessingTask` (iOS 26+) and `BGProcessingTask` fallback
 /// so active transfers started by the user continue across app switches and screen lock.
 @MainActor
 public final class BackgroundTransferLifecycle {
     public static let taskIdentifier = "app.totaldrop.ios.transfer"
+    private static var registeredIdentifiers: Set<String> = []
 
     private var activeStopCallback: (@MainActor () -> Void)?
 
     public init() {}
 
+    private func invokeSystemExpiration() {
+        activeStopCallback?()
+    }
+
     public func register(onSystemExpiration: @escaping @MainActor () -> Void) {
         self.activeStopCallback = onSystemExpiration
         #if os(iOS)
+        guard !Self.registeredIdentifiers.contains(Self.taskIdentifier) else {
+            return
+        }
+        Self.registeredIdentifiers.insert(Self.taskIdentifier)
         BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.taskIdentifier,
             using: nil
         ) { [weak self] task in
-            task.expirationHandler = { [weak self] in
-                task.setTaskCompleted(success: false)
+            let box = UncheckedBGTaskBox(task)
+            let owner = self
+            box.task.expirationHandler = {
+                box.task.setTaskCompleted(success: false)
                 Task { @MainActor in
-                    self?.activeStopCallback?()
+                    owner?.invokeSystemExpiration()
                 }
             }
         }
@@ -79,7 +123,7 @@ public final class BackgroundTransferLifecycle {
     }
 }
 
-/// Main `@Observable` state model for iOS and iPadOS.
+/// Main `@Observable` state model for iOS and iPadOS backed by live Rust FFI.
 @Observable
 @MainActor
 public final class IOSAppModel {
@@ -93,97 +137,172 @@ public final class IOSAppModel {
     public var bannerMessage: String?
 
     public var rendezvousServer: String = "wss://rendezvous.totaldrop.app"
+    public var relayServer: String = "wss://relay.totaldrop.app"
+    public var stunServer: String = "stun.cloudflare.com:3478"
     public var privacyMode: Bool = false
     public var layoutDirection: LayoutDirection = .leftToRight
+    public var uiBundle: RustMobileUIBundle
+    public var versionInfo: RustMobileVersionInfo?
 
+    private let bridge: any MobileBridgeProtocol
     private let bgLifecycle = BackgroundTransferLifecycle()
+    private var activeSessionHandle: UInt64 = 0
+    private var activeSessionIsSending: Bool = false
+    private var activeVerificationWords: [String] = []
+    private var activeOfferIsText: Bool = false
+    private var pollTask: Task<Void, Never>?
 
-    public init() {
-        let lang = Locale.current.language.languageCode?.identifier ?? "en"
-        if ["ar", "fa", "he", "ur"].contains(lang) {
-            self.layoutDirection = .rightToLeft
-        }
-        bgLifecycle.register { [weak self] in
-            self?.stopTransfer(expiredBySystem: true)
+    public init(
+        bridge: any MobileBridgeProtocol = LiveRustMobileBridge(),
+        preferredLanguages: [String] = Locale.preferredLanguages,
+        numericLocale: String? = Locale.current.identifier,
+        registerBackgroundTasks: Bool = false
+    ) {
+        self.bridge = bridge
+        let langs = preferredLanguages.isEmpty ? ["en"] : preferredLanguages
+        let bundle = bridge.loadUIBundle(preferredLanguages: langs, numericLocale: numericLocale)
+        self.uiBundle = bundle
+        self.versionInfo = bridge.versionInfo()
+        self.layoutDirection = bundle.isRtl ? .rightToLeft : .leftToRight
+
+        if registerBackgroundTasks {
+            bgLifecycle.register { [weak self] in
+                self?.stopTransfer(expiredBySystem: true)
+            }
         }
     }
 
-    /// Parses an incoming Universal Link (`https://totaldrop.app/r#<code>`) or `totaldrop://r/<code>`.
+    public func l10n(_ key: String, fallback: String) -> String {
+        uiBundle.text(key, fallback: fallback)
+    }
+
+    public var currentTransferConfig: RustMobileTransferConfig {
+        RustMobileTransferConfig(
+            server: rendezvousServer,
+            relay: relayServer,
+            stun: stunServer,
+            privacyMode: privacyMode,
+            strongerCode: strongerCode
+        )
+    }
+
+    public var defaultReceiveDirectory: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        return docs.appendingPathComponent("TotalDrop", isDirectory: true)
+    }
+
+    /// Parses an incoming Universal Link (`https://totaldrop.app/r#<code>`) or `totaldrop://r/<code>`
+    /// through the live Rust protocol validator.
     public func handleUniversalLink(_ url: URL) {
         if url.host == "share-extension" {
             ingestShareExtensionManifest()
             return
         }
-        guard let code = Self.parseLinkCode(url) else {
-            bannerMessage = "That link does not hold a valid TotalDrop code."
+        let langs = Locale.preferredLanguages.isEmpty ? ["en"] : Locale.preferredLanguages
+        let routed = bridge.handleURL(
+            rawURL: url.absoluteString,
+            activity: phase.activitySlug,
+            preferredLanguages: langs,
+            numericLocale: Locale.current.identifier
+        )
+        guard let routed, routed.ok else {
+            bannerMessage = l10n("errorBadCode", fallback: "That link does not hold a valid TotalDrop code.")
             return
         }
-        guard !phase.isBusy else {
-            bannerMessage = "Finish or stop what is on the screen, then open the link again."
-            return
+        switch routed.outcome {
+        case "connect_receive":
+            guard let code = routed.displayCode, !code.isEmpty else {
+                bannerMessage = l10n("errorBadCode", fallback: "That link does not hold a valid TotalDrop code.")
+                return
+            }
+            selectedTab = .receive
+            receiveCodeInput = code
+            connectToSender()
+        case "busy":
+            bannerMessage = routed.message
+                ?? l10n("linkBusy", fallback: "Finish or stop what is on the screen, then open the link again.")
+        default:
+            bannerMessage = l10n("errorBadCode", fallback: "That link does not hold a valid TotalDrop code.")
         }
-        selectedTab = .receive
-        receiveCodeInput = code
-        connectToSender()
     }
 
-    public static func parseLinkCode(_ url: URL) -> String? {
-        let raw = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard raw.utf8.count <= 1024 else { return nil }
-
-        let tail: String
-        if let s = raw.droppingPrefix("https://totaldrop.app/r#")
-            ?? raw.droppingPrefix("http://totaldrop.app/r#")
-            ?? raw.droppingPrefix("totaldrop://r/")
-            ?? raw.droppingPrefix("totaldrop:")
-        {
-            tail = s.removingPercentEncoding ?? s
-        } else {
-            return nil
-        }
-
-        let tokens = tail
-            .lowercased()
-            .split(whereSeparator: { $0 == "-" || $0.isWhitespace })
-            .map(String.init)
-        guard (3...4).contains(tokens.count),
-              let first = tokens.first,
-              let nameplate = UInt32(first),
-              nameplate > 0
+    public static func parseLinkCode(
+        _ url: URL,
+        bridge: any MobileBridgeProtocol = LiveRustMobileBridge()
+    ) -> String? {
+        guard let routed = bridge.handleURL(
+            rawURL: url.absoluteString,
+            activity: "idle",
+            preferredLanguages: ["en"],
+            numericLocale: "en_US"
+        ),
+            routed.ok,
+            routed.outcome == "connect_receive",
+            let code = routed.displayCode,
+            !code.isEmpty
         else {
             return nil
         }
-        let words = tokens.dropFirst()
-        guard words.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isLetter) }) else {
-            return nil
+        return code
+    }
+
+    public static func spokenVoiceOverCode(
+        _ code: String,
+        bridge: any MobileBridgeProtocol = LiveRustMobileBridge()
+    ) -> String {
+        if let res = bridge.voiceoverCode(code), res.ok, let spoken = res.spoken, !spoken.isEmpty {
+            return spoken
         }
-        return ([String(nameplate)] + words).joined(separator: "-")
+        return code.split(separator: "-").joined(separator: ", ")
     }
 
-    public static func spokenVoiceOverCode(_ code: String) -> String {
-        code.split(separator: "-").joined(separator: ", ")
+    public func extractClipboardCode(_ rawText: String) -> String {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let extracted = bridge.extractClipboardCode(trimmed),
+           extracted.ok,
+           let code = extracted.displayCode,
+           !code.isEmpty
+        {
+            return code
+        }
+        return trimmed
     }
 
-    /// Reads staged files written to `group.app.totaldrop.ios` by `ShareExtension`.
+    public func displayFilename(for url: URL) -> String {
+        let raw = url.lastPathComponent.precomposedStringWithCanonicalMapping
+        if let res = bridge.sanitizeFilename(raw), res.ok {
+            return res.sanitized
+        }
+        return raw
+    }
+
+    /// Reads and path-confinement validates staged files written to `group.app.totaldrop.ios`
+    /// by `ShareExtension` using `totaldrop_mobile_parse_share_manifest_json`.
     public func ingestShareExtensionManifest() {
         guard !phase.isBusy else {
-            bannerMessage = "A transfer is still running. Wait for it to finish or stop it, then share again."
+            bannerMessage = l10n(
+                "shareBusy",
+                fallback: "A transfer is still running. Wait for it to finish or stop it, then share again."
+            )
             return
         }
         guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupID) else {
             return
         }
         let manifestURL = container.appendingPathComponent("SharedInbox/manifest.json")
-        guard let data = try? Data(contentsOf: manifestURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let entries = json["entries"] as? [[String: Any]]
+        guard let rawJSON = try? String(contentsOf: manifestURL, encoding: .utf8),
+              let parsed = bridge.parseShareManifest(
+                  manifestJSON: rawJSON,
+                  appGroupRoot: container.path
+              ),
+              parsed.ok
         else {
             return
         }
-        selectedURLs = entries.compactMap { dict in
-            (dict["stagedPath"] as? String).map { URL(fileURLWithPath: $0) }
-        }
-        if let notice = json["notice"] as? String, !notice.isEmpty {
+        let entries = parsed.entries ?? []
+        selectedURLs = entries.map { URL(fileURLWithPath: $0.stagedPath) }
+        if let notice = parsed.notice, !notice.isEmpty {
             bannerMessage = notice
         }
         selectedTab = .send
@@ -191,24 +310,106 @@ public final class IOSAppModel {
 
     public func startSend() {
         guard !phase.isBusy, !selectedURLs.isEmpty else { return }
-        let code = strongerCode ? "7-harbor-rocket-meadow" : "7-harbor-rocket"
-        phase = .waitingForPeer(
-            code: code,
-            universalLink: "https://totaldrop.app/r#\(code)",
-            spokenCode: Self.spokenVoiceOverCode(code)
+        let paths = selectedURLs.map(\.path)
+        let langs = Locale.preferredLanguages.isEmpty ? ["en"] : Locale.preferredLanguages
+        let handle = bridge.startSendFiles(
+            paths: paths,
+            config: currentTransferConfig,
+            preferredLanguages: langs,
+            numericLocale: Locale.current.identifier
         )
+        guard handle != 0 else {
+            phase = .failed(
+                headline: l10n("errorOther", fallback: "Could not start sending."),
+                cause: nil,
+                technicalDetail: "totaldrop_mobile_session_start_send_files returned 0"
+            )
+            return
+        }
+        beginSession(handle: handle, isSending: true)
+        bgLifecycle.submitContinuedTransferRequest(isSending: true)
+    }
+
+    public func startSendText(_ text: String) {
+        guard !phase.isBusy, !text.isEmpty else { return }
+        let langs = Locale.preferredLanguages.isEmpty ? ["en"] : Locale.preferredLanguages
+        let handle = bridge.startSendText(
+            text: text,
+            config: currentTransferConfig,
+            preferredLanguages: langs,
+            numericLocale: Locale.current.identifier
+        )
+        guard handle != 0 else {
+            phase = .failed(
+                headline: l10n("errorOther", fallback: "Could not start sending text."),
+                cause: nil,
+                technicalDetail: "totaldrop_mobile_session_start_send_text returned 0"
+            )
+            return
+        }
+        beginSession(handle: handle, isSending: true)
         bgLifecycle.submitContinuedTransferRequest(isSending: true)
     }
 
     public func connectToSender() {
         let code = receiveCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !code.isEmpty, !phase.isBusy else { return }
+        let langs = Locale.preferredLanguages.isEmpty ? ["en"] : Locale.preferredLanguages
+        let handle = bridge.startReceive(
+            codeOrLink: code,
+            config: currentTransferConfig,
+            preferredLanguages: langs,
+            numericLocale: Locale.current.identifier
+        )
+        guard handle != 0 else {
+            phase = .failed(
+                headline: l10n("errorBadCode", fallback: "That code is not valid."),
+                cause: nil,
+                technicalDetail: "totaldrop_mobile_session_start_receive returned 0"
+            )
+            return
+        }
         phase = .connecting(code: code)
+        beginSession(handle: handle, isSending: false)
         bgLifecycle.submitContinuedTransferRequest(isSending: false)
     }
 
-    public func stopTransfer(expiredBySystem: Bool = false) {
+    public func acceptOffer(destination: URL? = nil) {
+        guard activeSessionHandle != 0 else { return }
+        let destPath: String?
+        if activeOfferIsText {
+            destPath = nil
+        } else {
+            let dir = destination ?? defaultReceiveDirectory
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            destPath = dir.path
+        }
+        let status = bridge.acceptOffer(handle: activeSessionHandle, destDir: destPath)
+        if status != 0 {
+            phase = .failed(
+                headline: l10n("errorOther", fallback: "Could not accept the incoming transfer."),
+                cause: nil,
+                technicalDetail: "totaldrop_mobile_session_accept_offer returned \(status)"
+            )
+            teardownActiveSession()
+        }
+    }
+
+    public func declineOffer() {
+        if activeSessionHandle != 0 {
+            _ = bridge.declineOffer(handle: activeSessionHandle)
+        }
         bgLifecycle.cancelPendingRequests()
+        teardownActiveSession()
+        phase = .idle
+    }
+
+    public func stopTransfer(expiredBySystem: Bool = false) {
+        if activeSessionHandle != 0 {
+            _ = bridge.stopSession(handle: activeSessionHandle)
+        }
+        bgLifecycle.cancelPendingRequests()
+        teardownActiveSession()
         if expiredBySystem {
             phase = .failed(
                 headline: "Transfer paused in the background.",
@@ -219,18 +420,144 @@ public final class IOSAppModel {
             phase = .idle
         }
     }
-}
 
-private extension String {
-    func droppingPrefix(_ prefix: String) -> String? {
-        guard hasPrefix(prefix) else { return nil }
-        return String(dropFirst(prefix.count))
+    private func beginSession(handle: UInt64, isSending: Bool) {
+        teardownActiveSession()
+        activeSessionHandle = handle
+        activeSessionIsSending = isSending
+        activeVerificationWords = []
+        activeOfferIsText = false
+        pollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.activeSessionHandle == handle else { return }
+                let events = self.bridge.pollEvents(handle: handle)
+                for ev in events {
+                    self.apply(event: ev)
+                    if self.activeSessionHandle != handle {
+                        return
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private func apply(event: RustMobileSessionEvent) {
+        switch event {
+        case .codeReady(
+            let displayCode,
+            _,
+            let universalLink,
+            let voiceoverSpokenCode,
+            let shareMessage,
+            _,
+            _,
+            _,
+            _,
+            _
+        ):
+            phase = .waitingForPeer(
+                code: displayCode,
+                universalLink: universalLink,
+                spokenCode: voiceoverSpokenCode,
+                shareMessage: shareMessage
+            )
+        case .waiting:
+            break
+        case .connected(let words, _):
+            activeVerificationWords = words
+            phase = .transferring(
+                isSending: activeSessionIsSending,
+                percent: 0,
+                summaryText: "",
+                words: words
+            )
+        case .offerReady(
+            let files,
+            _,
+            let totalBytes,
+            let formattedSize,
+            let isText,
+            _,
+            _,
+            let topLevelNames,
+            _,
+            _,
+            let hasHiddenControls,
+            let words,
+            _
+        ):
+            activeVerificationWords = words
+            activeOfferIsText = isText
+            phase = .incomingOffer(
+                files: files,
+                totalBytes: totalBytes,
+                formattedSize: formattedSize,
+                isText: isText,
+                words: words,
+                topLevelNames: topLevelNames,
+                hasHiddenControls: hasHiddenControls
+            )
+        case .progress(_, _, let percentValue, _, _, _, let fractionText):
+            phase = .transferring(
+                isSending: activeSessionIsSending,
+                percent: percentValue,
+                summaryText: fractionText,
+                words: activeVerificationWords
+            )
+        case .done(
+            let filesOk,
+            _,
+            _,
+            let formattedBytes,
+            let isText,
+            let savedTo,
+            _,
+            _,
+            let sanitizedText,
+            _,
+            _
+        ):
+            bgLifecycle.cancelPendingRequests()
+            let summary: String
+            if isText {
+                summary = activeSessionIsSending
+                    ? "Text sent and verified (\(formattedBytes))."
+                    : "Text received and verified (\(formattedBytes))."
+            } else if let savedTo, !savedTo.isEmpty {
+                summary = "Received \(filesOk) file(s) (\(formattedBytes)) in \(savedTo)."
+            } else {
+                summary = "Sent \(filesOk) file(s) (\(formattedBytes)) and verified."
+            }
+            phase = .finished(message: summary, receivedText: sanitizedText)
+            teardownActiveSession()
+        case .declined(_, let headline):
+            bgLifecycle.cancelPendingRequests()
+            phase = .failed(headline: headline, cause: nil, technicalDetail: "Offer declined by peer")
+            teardownActiveSession()
+        case .failed(let headline, let cause, let technicalDetail):
+            bgLifecycle.cancelPendingRequests()
+            phase = .failed(headline: headline, cause: cause, technicalDetail: technicalDetail)
+            teardownActiveSession()
+        }
+    }
+
+    private func teardownActiveSession() {
+        pollTask?.cancel()
+        pollTask = nil
+        if activeSessionHandle != 0 {
+            let handle = activeSessionHandle
+            activeSessionHandle = 0
+            _ = bridge.destroySession(handle: handle)
+        }
     }
 }
 
+#if TOTALDROP_APP_ENTRY
 @main
+#endif
 public struct TotalDropIOSApp: App {
-    @State private var model = IOSAppModel()
+    @State private var model = IOSAppModel(registerBackgroundTasks: true)
 
     public init() {}
 
@@ -324,12 +651,23 @@ struct IOSSettingsView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
             }
+            Section("Relay Server") {
+                TextField("wss://relay.totaldrop.app", text: $model.relayServer)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
             Section("Privacy") {
                 Toggle("Hide my address from the other device", isOn: $model.privacyMode)
                 Text("Everything goes through the relay so the other device never sees your IP address. Files stay end-to-end encrypted.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if let version = model.versionInfo {
+                Section("About") {
+                    LabeledContent("Version", value: "\(version.appVersion) (\(version.bundleVersion))")
+                    LabeledContent("Core", value: version.coreVersion)
+                }
             }
         }
         .navigationTitle("Settings")

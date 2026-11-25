@@ -23,7 +23,13 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CTotalDropAppleMobileFFI",
+            path: "Sources/CTotalDropAppleMobileFFI",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "TotalDropIOS",
+            dependencies: ["CTotalDropAppleMobileFFI"],
             path: "Sources/TotalDropIOS",
             swiftSettings: [
                 .swiftLanguageMode(.v6),
@@ -34,6 +40,9 @@ let package = Package(
                 .linkedFramework("BackgroundTasks"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("CoreFoundation"),
             ]
         ),
         .target(
@@ -50,7 +59,7 @@ let package = Package(
         ),
         .testTarget(
             name: "TotalDropIOSTests",
-            dependencies: ["TotalDropIOS"],
+            dependencies: ["TotalDropIOS", "CTotalDropAppleMobileFFI"],
             path: "Tests/TotalDropIOSTests",
             swiftSettings: [
                 .swiftLanguageMode(.v6),

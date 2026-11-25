@@ -26,12 +26,28 @@ public struct TvReceiveView: View {
             switch model.phase {
             case .connecting(let code):
                 connectingFocusCard(code: code)
-            case .offerReady(let files, let totalBytes, let words, let names):
-                offerFocusGrid(files: files, totalBytes: totalBytes, words: words, names: names)
+            case .offerReady(
+                let files,
+                let totalBytes,
+                let formattedSize,
+                let isText,
+                let words,
+                let names,
+                let hasHiddenControls
+            ):
+                offerFocusGrid(
+                    files: files,
+                    totalBytes: totalBytes,
+                    formattedSize: formattedSize,
+                    isText: isText,
+                    words: words,
+                    names: names,
+                    hasHiddenControls: hasHiddenControls
+                )
             case .transferring(let percent, let summary, let words):
                 progressFocusCard(percent: percent, summary: summary, words: words)
-            case .completed(let summary):
-                completedFocusCard(summary: summary)
+            case .completed(let summary, let receivedText):
+                completedFocusCard(summary: summary, receivedText: receivedText)
             case .failed(let headline, let detail):
                 failedFocusCard(headline: headline, detail: detail)
             default:
@@ -102,7 +118,15 @@ public struct TvReceiveView: View {
         .defaultFocus($focusedSlot, .cancelAction)
     }
 
-    private func offerFocusGrid(files: Int, totalBytes: UInt64, words: [String], names: [String]) -> some View {
+    private func offerFocusGrid(
+        files: Int,
+        totalBytes: UInt64,
+        formattedSize: String,
+        isText: Bool,
+        words: [String],
+        names: [String],
+        hasHiddenControls: Bool
+    ) -> some View {
         VStack(spacing: 32) {
             Button {} label: {
                 VStack(alignment: .leading, spacing: 12) {
@@ -122,8 +146,16 @@ public struct TvReceiveView: View {
             .focused($focusedSlot, equals: .verificationCard)
 
             VStack(spacing: 8) {
-                Text("\(files) file(s) · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: totalBytes), countStyle: .file))")
+                let sizeLabel = formattedSize.isEmpty
+                    ? ByteCountFormatter.string(fromByteCount: Int64(clamping: totalBytes), countStyle: .file)
+                    : formattedSize
+                Text(isText ? "Incoming text · \(sizeLabel)" : "\(files) file(s) · \(sizeLabel)")
                     .font(.headline)
+                if hasHiddenControls {
+                    Text("Hidden formatting characters were revealed in filenames.")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
                 ForEach(names.prefix(5), id: \.self) { item in
                     Text(item)
                         .font(.callout.monospaced())
@@ -133,7 +165,7 @@ public struct TvReceiveView: View {
 
             HStack(spacing: 40) {
                 Button {
-                    model.phase = .completed(summary: "Verified in Apple TV session cache (\(model.cachesStagingDirectory.path)).")
+                    model.acceptOffer()
                 } label: {
                     Label("Accept", systemImage: "checkmark.circle.fill")
                         .font(.title3.weight(.semibold))
@@ -144,7 +176,7 @@ public struct TvReceiveView: View {
                 .focused($focusedSlot, equals: .primaryAction)
 
                 Button(role: .destructive) {
-                    model.cancelOrReset()
+                    model.declineOffer()
                 } label: {
                     Label("Decline", systemImage: "xmark.circle.fill")
                         .font(.title3)
@@ -182,7 +214,7 @@ public struct TvReceiveView: View {
         }
     }
 
-    private func completedFocusCard(summary: String) -> some View {
+    private func completedFocusCard(summary: String, receivedText: String?) -> some View {
         VStack(spacing: 24) {
             Label("Received and verified", systemImage: "checkmark.seal.fill")
                 .font(.title2.weight(.bold))
@@ -190,6 +222,12 @@ public struct TvReceiveView: View {
             Text(summary)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if let receivedText, !receivedText.isEmpty {
+                Text(receivedText)
+                    .font(.body.monospaced())
+                    .padding(20)
+                    .frame(maxWidth: 860, alignment: .leading)
+            }
             Button {
                 model.codeInput = ""
                 model.cancelOrReset()

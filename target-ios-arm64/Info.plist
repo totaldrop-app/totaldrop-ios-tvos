@@ -8,6 +8,8 @@
   <string>TotalDrop</string>
   <key>CFBundleExecutable</key>
   <string>TotalDropIOS</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>app.totaldrop.ios</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -17,11 +19,13 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.2.0-beta.5</string>
+  <string>0.3.0-beta.6</string>
   <key>CFBundleVersion</key>
-  <string>0.2.0-beta.5</string>
+  <string>6</string>
   <key>LSRequiresIPhoneOS</key>
   <true/>
+  <key>MinimumOSVersion</key>
+  <string>18.0</string>
   <key>LSSupportsOpeningDocumentsInPlace</key>
   <true/>
   <key>UIFileSharingEnabled</key>

@@ -1,6 +1,11 @@
-# Hardened CI workflow for totaldrop-ios-tvos: cross-platform Rust bridge
-# checks, iOS device + simulator (arm64 + x86_64) static library builds,
-# dependency auditing, REUSE 3.3 licensing, and secret scanning.
+# SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Hardened CI workflow for totaldrop-ios-tvos (ADR 0009, ADR 0019, ADR 0020):
+# pinned macos-15 + Linux multi-arch Rust FFI/bridge checks, deterministic
+# opaque RGB Kose icons, 3-way C header & version parity, real iOS device +
+# universal simulator XCFramework assembly & native symbol checks, live Swift 6
+# iOS Simulator FFI tests, tvOS SDK compilation, cargo-deny, REUSE 3.3, and gitleaks.
 name: CI
 
 on:
@@ -8,6 +13,7 @@ on:
   push:
     branches: [main]
   merge_group:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -23,12 +29,12 @@ env:
 
 jobs:
   rust-bridge:
-    name: Rust Bridge (${{ matrix.os }})
+    name: Rust Bridge & FFI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,9 +50,37 @@ jobs:
           TOTALDROP_REQUIRE_IPV6: "1"
         run: cargo test --workspace --locked
 
-  apple-mobile-targets:
-    name: Apple Mobile Targets (iOS arm64 + Sim arm64/x86_64)
-    runs-on: macos-latest
+  static-checks:
+    name: Static assets, versions & subplatforms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify iOS/tvOS versions, 3-way C header & ADR 0009 runner parity
+        run: python3 tools/check-versions.py
+      - name: Verify deterministic opaque RGB Kose iOS & tvOS icons
+        run: python3 tools/render-apple-mobile-assets.py --check
+      - name: Self-test XCFramework verifier
+        run: python3 tools/verify-xcframework.py --self-test
+      - name: Verify 35-locale Localizable.xcstrings parity (iOS & tvOS)
+        run: >-
+          python3 -c 'import json;
+          assert len(json.load(open("ui-swiftui-ios/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35;
+          assert len(json.load(open("ui-swiftui-tvos/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35'
+      - name: Validate packaging shell script syntax & 6 subplatform units
+        run: |
+          for script in target-*/*.sh; do
+            bash -n "$script"
+          done
+          python3 tools/verify-subplatforms.py
+
+  apple-mobile-macos15:
+    name: Apple Mobile Rust Tests, XCFramework & Swift 6 Simulator CI (macos-15)
+    runs-on: macos-15
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+      TVOS_DEPLOYMENT_TARGET: "18.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,19 +89,93 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-      - name: Build Rust bridge (iOS device arm64)
-        run: cargo build --release --locked -p totaldrop-apple-mobile-bridge --target aarch64-apple-ios
-      - name: Build Rust bridge (iOS Simulator arm64)
-        run: cargo build --release --locked -p totaldrop-apple-mobile-bridge --target aarch64-apple-ios-sim
-      - name: Build Rust bridge (iOS Simulator x86_64)
-        run: cargo build --release --locked -p totaldrop-apple-mobile-bridge --target x86_64-apple-ios
-      - name: Validate Apple mobile packaging scripts, 35-locale xcstrings & 6 subplatform units
+          xcodebuild -version
+          xcodebuild -showsdks
+      - name: Clippy & Workspace Tests on macOS 15
+        env:
+          TOTALDROP_REQUIRE_IPV6: "1"
         run: |
-          for script in target-*/*.sh; do
-            bash -n "$script"
-          done
-          python3 -c 'import json; assert len(json.load(open("ui-swiftui-ios/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35; assert len(json.load(open("ui-swiftui-tvos/Resources/Localizable.xcstrings"))["strings"]["verificationTitle"]["localizations"]) == 35'
-          python3 tools/verify-subplatforms.py
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+      - name: Build Rust C ABI FFI staticlib (iOS device arm64)
+        run: cargo build --release --locked -p totaldrop-apple-mobile-ffi --target aarch64-apple-ios
+      - name: Build Rust C ABI FFI staticlib (iOS Simulator arm64)
+        run: cargo build --release --locked -p totaldrop-apple-mobile-ffi --target aarch64-apple-ios-sim
+      - name: Build Rust C ABI FFI staticlib (iOS Simulator x86_64)
+        run: cargo build --release --locked -p totaldrop-apple-mobile-ffi --target x86_64-apple-ios
+      - name: Assemble & natively verify TotalDropAppleMobileFFI.xcframework
+        run: |
+          ./target-tvos-arm64/build-xcframework.sh --ios-only --skip-build
+          python3 tools/verify-xcframework.py \
+            --xcframework dist/TotalDropAppleMobileFFI.xcframework \
+            --check-native
+      - name: Build Swift 6 iOS Device (TotalDropIOS + ShareExtension) & tvOS Simulator (TotalDropTV)
+        run: |
+          ROOT_DIR="$PWD"
+          (
+            cd "${ROOT_DIR}/ui-swiftui-ios"
+            xcodebuild -list
+            xcodebuild build \
+              -scheme TotalDropIOS \
+              -destination "generic/platform=iOS" \
+              -configuration Release \
+              CODE_SIGNING_ALLOWED=NO \
+              OTHER_LDFLAGS="\$(inherited) -L${ROOT_DIR}/target/aarch64-apple-ios/release -ltotaldrop_apple_mobile_ffi"
+            xcodebuild build \
+              -scheme ShareExtension \
+              -destination "generic/platform=iOS" \
+              -configuration Release \
+              CODE_SIGNING_ALLOWED=NO
+          )
+          if xcrun --sdk appletvsimulator --show-sdk-path >/dev/null 2>&1; then
+            (
+              cd "${ROOT_DIR}/ui-swiftui-tvos"
+              xcodebuild -list
+              xcodebuild build \
+                -scheme TotalDropTV \
+                -destination "generic/platform=tvOS Simulator" \
+                -configuration Release \
+                CODE_SIGNING_ALLOWED=NO
+            )
+          else
+            echo "::warning::appletvsimulator SDK not installed on this runner image; skipping TotalDropTV SDK compile"
+          fi
+      - name: Run live Swift 6 + Rust FFI tests on iPhone Simulator
+        run: |
+          ROOT_DIR="$PWD"
+          HOST_ARCH="$(uname -m)"
+          if [ "$HOST_ARCH" = "arm64" ]; then
+            SIM_RUST_TARGET="aarch64-apple-ios-sim"
+          else
+            SIM_RUST_TARGET="x86_64-apple-ios"
+          fi
+          SIM_UDID="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in sorted(data.get("devices", {}).items(), reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              for dev in devices:
+                  if dev.get("isAvailable") and "iPhone" in dev.get("name", ""):
+                      print(dev["udid"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')"
+          echo "Using available iPhone Simulator UDID: ${SIM_UDID} (Rust target: ${SIM_RUST_TARGET})"
+          (
+            cd "${ROOT_DIR}/ui-swiftui-ios"
+            TEST_SCHEME="TotalDropIOS"
+            if xcodebuild -list | grep -qx '[[:space:]]*TotalDropIOS-Package'; then
+              TEST_SCHEME="TotalDropIOS-Package"
+            fi
+            echo "Running Swift 6 + live Rust FFI tests via scheme: ${TEST_SCHEME}"
+            xcodebuild test \
+              -scheme "${TEST_SCHEME}" \
+              -only-testing:TotalDropIOSTests \
+              -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+              CODE_SIGNING_ALLOWED=NO \
+              OTHER_LDFLAGS="\$(inherited) -L${ROOT_DIR}/target/${SIM_RUST_TARGET}/release -ltotaldrop_apple_mobile_ffi -framework Security -framework SystemConfiguration -framework CoreFoundation"
+          )
 
   deny:
     name: Dependencies (cargo-deny)
@@ -152,7 +260,7 @@ jobs:
   gate:
     name: CI
     if: always()
-    needs: [rust-bridge, apple-mobile-targets, deny, reuse, secrets]
+    needs: [rust-bridge, static-checks, apple-mobile-macos15, deny, reuse, secrets]
     runs-on: ubuntu-latest
     steps:
       - env:

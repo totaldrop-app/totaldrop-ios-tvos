@@ -30,6 +30,63 @@ public struct TvSendView: View {
             switch model.phase {
             case .waitingToPair(let code, let qrPayload):
                 pairingCards(code: code, qrPayload: qrPayload)
+            case .transferring(let percent, let summary, let words):
+                VStack(spacing: 24) {
+                    if !words.isEmpty {
+                        Text(words.joined(separator: " · "))
+                            .font(.title3.monospaced())
+                    }
+                    ProgressView(value: Double(percent), total: 100.0) {
+                        Text("Sending (\(percent)%) — \(summary)")
+                            .font(.headline.monospacedDigit())
+                    }
+                    .frame(maxWidth: 820)
+                    Button(role: .destructive) {
+                        model.cancelOrReset()
+                    } label: {
+                        Text("Stop")
+                            .padding(.horizontal, 40)
+                            .padding(.vertical, 16)
+                    }
+                    .buttonStyle(.card)
+                    .focused($focusedSlot, equals: .cancelAction)
+                }
+            case .completed(let summary, _):
+                VStack(spacing: 24) {
+                    Label("Sent and verified", systemImage: "checkmark.seal.fill")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.green)
+                    Text(summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        model.cancelOrReset()
+                    } label: {
+                        Text("Done")
+                            .padding(.horizontal, 42)
+                            .padding(.vertical, 16)
+                    }
+                    .buttonStyle(.card)
+                    .focused($focusedSlot, equals: .primaryAction)
+                }
+            case .failed(let headline, let detail):
+                VStack(spacing: 20) {
+                    Label(headline, systemImage: "exclamationmark.triangle.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.red)
+                    Text(detail)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                    Button {
+                        model.cancelOrReset()
+                    } label: {
+                        Text("Try again")
+                            .padding(.horizontal, 42)
+                            .padding(.vertical, 16)
+                    }
+                    .buttonStyle(.card)
+                    .focused($focusedSlot, equals: .primaryAction)
+                }
             default:
                 setupCards
             }

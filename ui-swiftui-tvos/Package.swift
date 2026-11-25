@@ -18,7 +18,13 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CTotalDropAppleMobileFFI",
+            path: "Sources/CTotalDropAppleMobileFFI",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "TotalDropTV",
+            dependencies: ["CTotalDropAppleMobileFFI"],
             path: "Sources/TotalDropTV",
             swiftSettings: [
                 .swiftLanguageMode(.v6),
@@ -27,6 +33,8 @@ let package = Package(
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("UIKit"),
                 .linkedFramework("CoreImage"),
+                .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
             ]
         ),
     ]

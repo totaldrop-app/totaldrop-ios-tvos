@@ -32,6 +32,7 @@ allow = [
 # repository licensing policy, and document the rationale in the pull request.
 exceptions = [
     { allow = ["GPL-3.0-or-later"], crate = "totaldrop-apple-mobile-bridge" },
+    { allow = ["GPL-3.0-or-later"], crate = "totaldrop-apple-mobile-ffi" },
 ]
 
 [bans]
